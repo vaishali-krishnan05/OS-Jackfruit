@@ -53,27 +53,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/*
- * monitor_ioctl.h is a kernel header but only uses __u32 / unsigned long,
- * which are safe to include from user-space with _GNU_SOURCE.
- * We redefine the ioctl macros using <sys/ioctl.h> types here.
- */
-#ifndef CONTAINER_ID_MAX
-#define CONTAINER_ID_MAX 64
-#endif
-
-/* Mirrored from monitor_ioctl.h so we don't pull linux/ headers here */
-#define MONITOR_MAGIC      0xCE
-
-struct monitor_request_us {
-    unsigned int  pid;
-    char          container_id[CONTAINER_ID_MAX];
-    unsigned long soft_limit_bytes;
-    unsigned long hard_limit_bytes;
-};
-
-#define MONITOR_REGISTER   _IOW(MONITOR_MAGIC, 1, struct monitor_request_us)
-#define MONITOR_UNREGISTER _IOW(MONITOR_MAGIC, 2, struct monitor_request_us)
+#include "monitor_ioctl.h"
 
 /* ------------------------------------------------------------------ */
 
@@ -555,12 +535,12 @@ int register_with_monitor(int monitor_fd,
                           unsigned long soft_limit_bytes,
                           unsigned long hard_limit_bytes)
 {
-    struct monitor_request_us req;
+    struct monitor_request req;
     memset(&req, 0, sizeof(req));
-    req.pid              = (unsigned int)host_pid;
+    req.pid              = host_pid;
     req.soft_limit_bytes = soft_limit_bytes;
     req.hard_limit_bytes = hard_limit_bytes;
-    strncpy(req.container_id, container_id, sizeof(req.container_id) - 1);
+    strncpy(req.container_id, container_id, MONITOR_NAME_LEN - 1);
 
     if (ioctl(monitor_fd, MONITOR_REGISTER, &req) < 0)
         return -1;
@@ -571,10 +551,10 @@ int unregister_from_monitor(int monitor_fd,
                             const char *container_id,
                             pid_t host_pid)
 {
-    struct monitor_request_us req;
+    struct monitor_request req;
     memset(&req, 0, sizeof(req));
-    req.pid = (unsigned int)host_pid;
-    strncpy(req.container_id, container_id, sizeof(req.container_id) - 1);
+    req.pid = host_pid;
+    strncpy(req.container_id, container_id, MONITOR_NAME_LEN - 1);
 
     if (ioctl(monitor_fd, MONITOR_UNREGISTER, &req) < 0)
         return -1;
@@ -1215,7 +1195,7 @@ static int send_control_request(const control_request_t *req)
                 fwrite(accum, 1, text_len, stdout);
             memcpy(&resp, accum + text_len, sizeof(resp));
         }
-        free(accum);
+        if (accum) free(accum);
     } else {
         /* Simple request: just read the response frame */
         n = read(fd, &resp, sizeof(resp));

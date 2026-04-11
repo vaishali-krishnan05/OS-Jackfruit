@@ -58,9 +58,9 @@
 #define DEVICE_NAME        "container_monitor"
 #define CHECK_INTERVAL_SEC 1
 
-/* ==============================================================
- * TODO 1: Linked-list node struct.
- * ============================================================== */
+/* ---------------------------------------------------------------
+ * Linked-list node struct.
+ * --------------------------------------------------------------- */
 struct monitored_entry {
     pid_t           pid;
     char            container_id[CONTAINER_ID_MAX];
@@ -70,38 +70,60 @@ struct monitored_entry {
     struct list_head node;
 };
 
-/* ==============================================================
- * TODO 2: Global list + lock.
+/* ---------------------------------------------------------------
+ * Global list + lock.
  *
  * We use a mutex (see file-top rationale). The timer callback uses
- * mutex_trylock so it never blocks in softirq context.
- * ============================================================== */
+ * mutex_trylock so it never blocks in softirq/timer context.
+ * --------------------------------------------------------------- */
 static LIST_HEAD(monitored_list);
 static DEFINE_MUTEX(monitored_lock);
 
-/* --- Provided: internal device / timer state --- */
+/* --- internal device / timer state --- */
 static struct timer_list monitor_timer;
-static dev_t   dev_num;
+static dev_t            dev_num;
 static struct cdev      c_dev;
 static struct class    *cl;
 
 /* ---------------------------------------------------------------
- * Provided: RSS Helper
+ * RSS Helper
+ *
+ * Looks up the task by its host-namespace PID using find_get_pid(),
+ * which searches init_pid_ns rather than the calling task's namespace.
+ * This is correct because engine.c registers the host-side PID
+ * (the value returned by clone()), not the in-container PID 1.
+ *
+ * find_vpid() would resolve against the current task's pid namespace,
+ * which is wrong when called from a timer callback that runs in
+ * arbitrary context — it would fail to find the container process and
+ * return -1, causing the entry to be spuriously removed.
  * --------------------------------------------------------------- */
 static long get_rss_bytes(pid_t pid)
 {
     struct task_struct *task;
     struct mm_struct   *mm;
     long rss_pages = 0;
+    struct pid *pid_struct;
+
+    /*
+     * find_get_pid() looks up the PID in init_pid_ns (the host namespace),
+     * which is what we want — the PID registered by the supervisor is always
+     * the host-namespace PID returned by clone().
+     */
+    pid_struct = find_get_pid(pid);
+    if (!pid_struct)
+        return -1;
 
     rcu_read_lock();
-    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    task = pid_task(pid_struct, PIDTYPE_PID);
     if (!task) {
         rcu_read_unlock();
+        put_pid(pid_struct);
         return -1;
     }
     get_task_struct(task);
     rcu_read_unlock();
+    put_pid(pid_struct);
 
     mm = get_task_mm(task);
     if (mm) {
@@ -114,7 +136,7 @@ static long get_rss_bytes(pid_t pid)
 }
 
 /* ---------------------------------------------------------------
- * Provided: soft-limit helper
+ * Soft-limit helper
  * --------------------------------------------------------------- */
 static void log_soft_limit_event(const char *container_id,
                                  pid_t pid,
@@ -127,28 +149,43 @@ static void log_soft_limit_event(const char *container_id,
 }
 
 /* ---------------------------------------------------------------
- * Provided: hard-limit helper
+ * Hard-limit helper
+ *
+ * BUG FIX: The original used find_vpid() which resolves against the
+ * current task's PID namespace.  When the timer fires in arbitrary
+ * context the "current" namespace is not the supervisor's namespace,
+ * so find_vpid() returns NULL and send_sig() is never called —
+ * explaining why HARD LIMIT was logged but the process was not killed.
+ *
+ * Fix: use find_get_pid() (init_pid_ns lookup) + kill_pid(), which
+ * is both namespace-correct and the preferred kernel API for sending
+ * signals to a process by PID number.
  * --------------------------------------------------------------- */
 static void kill_process(const char *container_id,
                          pid_t pid,
                          unsigned long limit_bytes,
                          long rss_bytes)
 {
-    struct task_struct *task;
+    struct pid *pid_struct;
 
-    rcu_read_lock();
-    task = pid_task(find_vpid(pid), PIDTYPE_PID);
-    if (task)
-        send_sig(SIGKILL, task, 1);
-    rcu_read_unlock();
+    /*
+     * kill_pid() takes a struct pid * and sends the signal through the
+     * proper signal-delivery machinery (respects signal masks, etc.).
+     * We use SIGKILL (unblockable) so the container is guaranteed to die.
+     */
+    pid_struct = find_get_pid(pid);
+    if (pid_struct) {
+        kill_pid(pid_struct, SIGKILL, 1);
+        put_pid(pid_struct);
+    }
 
     printk(KERN_WARNING
-           "[container_monitor] HARD LIMIT container=%s pid=%d rss=%ld limit=%lu\n",
+           "[container_monitor] HARD LIMIT container=%s pid=%d rss=%ld limit=%lu — SIGKILL sent\n",
            container_id, pid, rss_bytes, limit_bytes);
 }
 
 /* ---------------------------------------------------------------
- * TODO 3: Timer Callback
+ * Timer Callback
  * --------------------------------------------------------------- */
 static void timer_callback(struct timer_list *t)
 {
@@ -166,7 +203,7 @@ static void timer_callback(struct timer_list *t)
     list_for_each_entry_safe(entry, tmp, &monitored_list, node) {
         rss = get_rss_bytes(entry->pid);
 
-        /* Process has exited - clean up the entry. */
+        /* Process has exited — clean up the entry. */
         if (rss < 0) {
             printk(KERN_INFO
                    "[container_monitor] PID %d exited, removing from container=%s\n",
@@ -186,7 +223,7 @@ static void timer_callback(struct timer_list *t)
             continue;
         }
 
-        /* Soft limit: warn once. */
+        /* Soft limit: warn once per crossing. */
         if (entry->soft_limit_bytes > 0 &&
             (unsigned long)rss > entry->soft_limit_bytes &&
             !entry->soft_warned) {
@@ -239,10 +276,6 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                req.container_id, req.pid,
                req.soft_limit_bytes, req.hard_limit_bytes);
 
-        /* ==============================================================
-         * TODO 4: Add a monitored entry.
-         * ============================================================== */
-
         /* Basic sanity: soft limit must be below hard limit when both set. */
         if (req.soft_limit_bytes > 0 && req.hard_limit_bytes > 0 &&
             req.soft_limit_bytes >= req.hard_limit_bytes) {
@@ -277,13 +310,11 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
            "[container_monitor] Unregister request container=%s pid=%d\n",
            req.container_id, req.pid);
 
-    /* ==============================================================
-     * TODO 5: Remove a monitored entry.
-     *
-     * Match on both PID and container_id for precision; a runtime
-     * could manage multiple containers, so PID alone is insufficient
-     * when PIDs are recycled across namespaces.
-     * ============================================================== */
+    /*
+     * Match on both PID and container_id for precision; a runtime could
+     * manage multiple containers, so PID alone is insufficient when PIDs
+     * are recycled across namespaces.
+     */
     mutex_lock(&monitored_lock);
     list_for_each_entry_safe(entry, tmp, &monitored_list, node) {
         if (entry->pid == (pid_t)req.pid &&
@@ -300,13 +331,13 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     return -ENOENT;     /* no matching entry */
 }
 
-/* --- Provided: file operations --- */
+/* --- file operations --- */
 static struct file_operations fops = {
     .owner          = THIS_MODULE,
     .unlocked_ioctl = monitor_ioctl,
 };
 
-/* --- Provided: Module Init --- */
+/* --- Module Init --- */
 static int __init monitor_init(void)
 {
     if (alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME) < 0)
@@ -344,21 +375,18 @@ static int __init monitor_init(void)
     return 0;
 }
 
-/* --- Provided: Module Exit --- */
+/* --- Module Exit --- */
 static void __exit monitor_exit(void)
 {
     struct monitored_entry *entry, *tmp;
 
+    /*
+     * timer_delete_sync() guarantees the timer callback has finished and
+     * will not fire again, so no timer tick can race with our list walk.
+     * We still take the lock for correctness against any in-flight ioctl.
+     */
     timer_delete_sync(&monitor_timer);
 
-    /* ==============================================================
-     * TODO 6: Free all remaining monitored entries.
-     *
-     * timer_delete_sync() guarantees the timer callback has finished and
-     * will not fire again, so we can walk the list without the lock.
-     * We take the lock anyway for correctness in case any other path
-     * (e.g., an in-flight ioctl) is still running.
-     * ============================================================== */
     mutex_lock(&monitored_lock);
     list_for_each_entry_safe(entry, tmp, &monitored_list, node) {
         list_del(&entry->node);
