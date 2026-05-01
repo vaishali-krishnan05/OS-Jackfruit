@@ -188,5 +188,5 @@ GitHub Actions runs a smoke check on every push:
 ## Authors
 
 **Vaishali Krishnan- PES1UG24AM313**
-**Samyuktha Vadrevu- PES1UG24AM316**
+**Samyuktha Vadrevu- PES1UG24AM312**
 Btech Computer Science & Engineering (AI/ML), PES University
